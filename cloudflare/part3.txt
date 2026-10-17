@@ -1,0 +1,79 @@
+function mdToBlocks(md) {
+  const blocks = [];
+  const pushChunked = (type, text) => {
+    let t = text;
+    const chunks = [];
+    while (t.length > 1900) { chunks.push(t.slice(0, 1900)); t = t.slice(1900); }
+    if (t) chunks.push(t);
+    for (const c of chunks) blocks.push({ object: "block", type, [type]: { rich_text: [{ type: "text", text: { content: c } }] } });
+  };
+  for (const rawLine of String(md || "").split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line)) { blocks.push({ object: "block", type: "divider", divider: {} }); continue; }
+    if (line.startsWith("### ")) pushChunked("heading_3", line.slice(4));
+    else if (line.startsWith("## ")) pushChunked("heading_2", line.slice(3));
+    else if (line.startsWith("# ")) pushChunked("heading_1", line.slice(2));
+    else if (/^[-*•]\s+/.test(line)) pushChunked("bulleted_list_item", line.replace(/^[-*•]\s+/, ""));
+    else if (/^\d+[.)]\s+/.test(line)) pushChunked("numbered_list_item", line.replace(/^\d+[.)]\s+/, ""));
+    else if (line.startsWith("> ")) pushChunked("quote", line.slice(2));
+    else pushChunked("paragraph", line);
+    if (blocks.length >= 95) break;
+  }
+  return blocks;
+}
+async function publishNotion(env, title, content) {
+  if (!env.NOTION_API_KEY) throw new Error("NOTION_API_KEY_MISSING");
+  const headers = { Authorization: "Bearer " + env.NOTION_API_KEY, "Notion-Version": "2022-06-28", "Content-Type": "application/json" };
+  const parentId = env.NOTION_PARENT_PAGE_ID || NOTION_PARENT_PAGE_ID;
+  const res = await fetch("https://api.notion.com/v1/pages", { method: "POST", headers, body: JSON.stringify({ parent: { page_id: parentId }, icon: { type: "emoji", emoji: "🧭" }, properties: { title: [{ text: { content: title } }] } }), signal: AbortSignal.timeout(60000) });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error("NOTION_HTTP_" + res.status + ": " + JSON.stringify(j).slice(0, 500));
+  const blocks = mdToBlocks(content);
+  for (let i = 0; i < blocks.length; i += 100) {
+    const r = await fetch("https://api.notion.com/v1/blocks/" + j.id + "/children", { method: "PATCH", headers, body: JSON.stringify({ children: blocks.slice(i, i + 100) }), signal: AbortSignal.timeout(60000) });
+    if (!r.ok) throw new Error("NOTION_BLOCKS_HTTP_" + r.status + ": " + (await r.text()).slice(0, 400));
+  }
+  return { id: j.id, url: j.url };
+}
+async function logRun(env, row) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+  try {
+    await fetch(env.SUPABASE_URL.replace(/\/+$/, "") + "/rest/v1/scae_brief_runs", { method: "POST", headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + env.SUPABASE_SERVICE_ROLE_KEY, "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify(row), signal: AbortSignal.timeout(15000) });
+  } catch (e) {}
+}
+async function runBrief(env, source) {
+  const d = qatarNow();
+  const title = buildTitle(d);
+  const dateLine = buildDateLine(d);
+  const runDate = d.year + "-" + String(d.month).padStart(2, "0") + "-" + String(d.day).padStart(2, "0");
+  try {
+    const digest = await fetchNews(Date.now());
+    const brief = await synthesizeBrief(env, digest, title, dateLine);
+    const content = "**" + dateLine + "**\n\n" + brief.content;
+    const page = await publishNotion(env, title, content);
+    await logRun(env, { run_date: runDate, title, escal_index: brief.escalIndex, notion_page_id: page.id, notion_url: page.url, status: "success", source, detail: { model: env.SCAE_MODEL || DEFAULT_MODEL } });
+    return { ok: true, title, escal_index: brief.escalIndex, notion_page_id: page.id, notion_url: page.url };
+  } catch (e) {
+    await logRun(env, { run_date: runDate, title, status: "error", source, detail: { error: String((e && e.message) || e).slice(0, 900) } });
+    throw e;
+  }
+}
+function tokenOk(req, env) {
+  const a = req.headers.get("authorization") || "";
+  const t = a.replace(/^Bearer\s+/i, "").trim();
+  return Boolean(env.ADMIN_TOKEN) && t.length > 0 && t === env.ADMIN_TOKEN;
+}
+export default {
+  async scheduled(event, env, ctx) { ctx.waitUntil(runBrief(env, "cron")); },
+  async fetch(req, env, ctx) {
+    const url = new URL(req.url);
+    if (url.pathname === "/health") return Response.json({ ok: true, worker: "scae-morning-brief", tz: QATAR_TZ, schedule_doha: "09:00 daily", cron_utc: "0 6 * * *", mistral: Boolean(env.MISTRAL_API_KEY), notion: Boolean(env.NOTION_API_KEY), supabase_log: Boolean(env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY), model: env.SCAE_MODEL || DEFAULT_MODEL });
+    if (url.pathname === "/run" && req.method === "POST") {
+      if (!env.ADMIN_TOKEN) return Response.json({ ok: false, error: "ADMIN_TOKEN_NOT_SET" }, { status: 503 });
+      if (!tokenOk(req, env)) return Response.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
+      try { return Response.json(await runBrief(env, "http")); } catch (e) { return Response.json({ ok: false, error: String((e && e.message) || e) }, { status: 500 }); }
+    }
+    return Response.json({ ok: true, service: "scae-morning-brief", endpoints: ["GET /health", "POST /run (Bearer ADMIN_TOKEN)"] });
+  },
+};
