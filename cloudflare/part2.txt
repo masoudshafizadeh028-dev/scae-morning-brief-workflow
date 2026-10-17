@@ -1,0 +1,67 @@
+function deEnt(s) {
+  return s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'").replace(/&amp;/g, "&");
+}
+function tagText(block, tag) {
+  const m = block.match(new RegExp("<" + tag + "(?:\\s[^>]*)?>([\\s\\S]*?)</" + tag + ">", "i"));
+  return m ? deEnt(m[1]).trim() : "";
+}
+function fmtUtc(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) + " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + " UTC";
+}
+async function fetchNews(nowMs) {
+  const cutoff = nowMs - 48 * 3600 * 1000;
+  const seen = new Set();
+  const items = [];
+  for (const [query, lang] of FEED_QUERIES) {
+    try {
+      const res = await fetch(feedUrl(query, lang), { cf: { cacheTtl: 0 }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), headers: { "User-Agent": "Mozilla/5.0 (compatible; SCAE-Morning-Brief/1.0)" } });
+      if (!res.ok) continue;
+      const xml = await res.text();
+      for (const m of xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)) {
+        const blk = m[1];
+        const title = tagText(blk, "title");
+        if (!title) continue;
+        const key = title.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const source = tagText(blk, "source") || "Google News";
+        const rawDate = tagText(blk, "pubDate");
+        let published = null;
+        if (rawDate) { const t = Date.parse(rawDate); if (!Number.isNaN(t)) published = t; }
+        items.push({ title, source, published, sortKey: published !== null ? published : nowMs });
+      }
+    } catch (e) {}
+  }
+  if (items.length === 0) throw new Error("هیچ فید خبری در دسترس نبود؛ جمع‌آوری اخبار ناموفق بود.");
+  const recent = items.filter((it) => it.published === null || it.published >= cutoff);
+  const selected = (recent.length >= MIN_RECENT ? recent : items).sort((a, b) => b.sortKey - a.sortKey).slice(0, MAX_ITEMS);
+  return selected.map((it) => "- " + it.title + " | منبع: " + it.source + " | زمان: " + (it.published !== null ? fmtUtc(it.published) : "بدون زمان")).join("\n");
+}
+const SYSTEM_PROMPT = "تو تحلیلگر ارشد سامانه راهبردی SCAE هستی و گزارش سیگنال صبحگاهی روزانه تولید می‌کنی. زبان گزارش فارسی رسمی، صریح و بدون غلط املایی است. ساختار دقیق متن گزارش در قالب مارک‌داون: یک پاراگراف موجز درباره تصویر کلان میدان (حداکثر سه خط)؛ سپس تیتر پنج سیگنال صبحگاهی با دقیقا پنج آیتم، که هر آیتم یک جمله خبر و یک جمله تحلیل کوتاه دارد و نام منبع را ذکر می‌کند؛ سپس تیتر شاخص تشدید با یک عدد از صفر تا ده و یک جمله توجیه؛ سپس تیتر هشدار ۲۴ ساعته با دقیقا یک شاخص مشخص برای پایش در ۲۴ ساعت آینده و دلیل آن؛ و در پایان تیتر هشتگ‌ها با سه تا شش هشتگ فارسی مرتبط. از احساساتی‌نویسی و ادعای قطعی بدون شواهد پرهیز کن و در صورت نبود قطعیت از زبان احتمالی استفاده کن. خروجی فقط باید JSON معتبر با دو کلید باشد: escal_index به صورت عدد صحیح از صفر تا ده، و content به صورت متن کامل مارک‌داون گزارش.";
+function cleanJsonText(raw) {
+  raw = String(raw || "").trim();
+  const fence = "```";
+  if (raw.startsWith(fence)) {
+    raw = raw.slice(fence.length);
+    if (raw.slice(0, 4).toLowerCase() === "json") raw = raw.slice(4);
+    raw = raw.trim();
+  }
+  if (raw.endsWith(fence)) raw = raw.slice(0, -fence.length).trim();
+  return raw;
+}
+async function synthesizeBrief(env, digest, title, dateLine) {
+  if (!env.MISTRAL_API_KEY) throw new Error("MISTRAL_API_KEY_MISSING");
+  const model = env.SCAE_MODEL || DEFAULT_MODEL;
+  const userMsg = "عنوان گزارش: " + title + "\n" + "خط تاریخ: " + dateLine + "\n\n" + "اخبار ۴۸ ساعت گذشته:\n" + digest;
+  const res = await fetch("https://api.mistral.ai/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + env.MISTRAL_API_KEY }, body: JSON.stringify({ model, temperature: 0.3, response_format: { type: "json_object" }, messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: userMsg }] }), signal: AbortSignal.timeout(120000) });
+  if (!res.ok) throw new Error("MISTRAL_HTTP_" + res.status + ": " + (await res.text()).slice(0, 400));
+  const j = await res.json();
+  const data = JSON.parse(cleanJsonText(j.choices?.[0]?.message?.content || ""));
+  const content = String(data.content || "").trim();
+  if (!content) throw new Error("محتوای گزارش تولیدشده خالی بود.");
+  let escal = parseInt(data.escal_index ?? 5, 10);
+  if (Number.isNaN(escal)) escal = 5;
+  return { escalIndex: escal, content };
+}
