@@ -1,0 +1,46 @@
+// SCAE Morning Signal Report - Cloudflare Worker (daily 09:00 Asia/Qatar)
+const QATAR_TZ = "Asia/Qatar";
+const DEFAULT_MODEL = "mistral-medium-latest";
+const NOTION_PARENT_PAGE_ID = "3c51bfb5-0d1d-8180-a835-e929813e481d";
+const MAX_ITEMS = 30;
+const MIN_RECENT = 8;
+const FETCH_TIMEOUT_MS = 25000;
+const FEED_QUERIES = [["Iran Strait of Hormuz", "en"], ["Iran war negotiations", "en"], ["ایران هرمز", "fa"]];
+const GMONTHS = ["ژانویه", "فوریه", "مارس", "آوریل", "مه", "ژوئن", "ژوئیه", "اوت", "سپتامبر", "اکتبر", "نوامبر", "دسامبر"];
+const JMONTHS = ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور", "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"];
+const WEEKDAYS = ["دوشنبه", "سه‌شنبه", "چهارشنبه", "پنج‌شنبه", "جمعه", "شنبه", "یکشنبه"];
+function toFa(v) { return String(v).replace(/[0-9]/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]); }
+function gregorianToJalali(gy, gm, gd) {
+  const gdm = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+  const gy2 = gm > 2 ? gy + 1 : gy;
+  let days = 355666 + 365 * gy + Math.floor((gy2 + 3) / 4) - Math.floor((gy2 + 99) / 100) + Math.floor((gy2 + 399) / 400) + gd + gdm[gm - 1];
+  let jy = -1595 + 33 * Math.floor(days / 12053);
+  days %= 12053;
+  jy += 4 * Math.floor(days / 1461);
+  days %= 1461;
+  if (days > 365) { jy += Math.floor((days - 1) / 365); days = (days - 1) % 365; }
+  let jm, jd;
+  if (days < 186) { jm = 1 + Math.floor(days / 31); jd = 1 + (days % 31); }
+  else { jm = 7 + Math.floor((days - 186) / 30); jd = 1 + ((days - 186) % 30); }
+  return [jy, jm, jd];
+}
+function qatarNow() {
+  const now = new Date();
+  const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: QATAR_TZ, year: "numeric", month: "2-digit", day: "2-digit", weekday: "short" });
+  const parts = {};
+  for (const p of fmt.formatToParts(now)) parts[p.type] = p.value;
+  const order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  return { now, year: Number(parts.year), month: Number(parts.month), day: Number(parts.day), weekday: order.indexOf(parts.weekday) };
+}
+function buildTitle(d) { return "SCAE | Morning Signal Report — " + toFa(d.day) + " " + GMONTHS[d.month - 1] + " " + toFa(d.year); }
+function buildDateLine(d) {
+  const [jy, jm, jd] = gregorianToJalali(d.year, d.month, d.day);
+  const greg = WEEKDAYS[d.weekday] + " " + toFa(d.day) + " " + GMONTHS[d.month - 1] + " " + toFa(d.year);
+  const jalali = toFa(jd) + " " + JMONTHS[jm - 1] + " " + toFa(jy);
+  return greg + " | " + jalali + " | دوحه (UTC+3)";
+}
+function feedUrl(query, lang) {
+  const q = encodeURIComponent(query + " when:2d").replace(/%20/g, "+");
+  if (lang === "fa") return "https://news.google.com/rss/search?q=" + q + "&hl=fa&gl=IR&ceid=IR:fa";
+  return "https://news.google.com/rss/search?q=" + q + "&hl=en-US&gl=US&ceid=US:en";
+}
